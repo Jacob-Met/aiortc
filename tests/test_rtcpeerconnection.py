@@ -2027,6 +2027,100 @@ a=rtpmap:8 PCMA/8000
         )
 
     @asynctest
+    async def test_connect_audio_reoffer_updates_ssrc_mapping(self) -> None:
+        # Two bundled audio receivers use the same RTP payload types. A new
+        # SSRC on an existing MID must not be lost due to ambiguous PT routing.
+        from aiortc.rtp import RtpPacket
+
+        configuration = RTCConfiguration(iceServers=[])
+        pc1 = RTCPeerConnection(configuration)
+        pc2 = RTCPeerConnection(configuration)
+        remote_tracks = track_remote_tracks(pc2)
+        try:
+            pc1.addTrack(AudioStreamTrack())
+            pc1.addTrack(AudioStreamTrack())
+            await pc1.setLocalDescription()
+            offer = pc1.localDescription
+            await pc2.setRemoteDescription(offer)
+            await pc2.setLocalDescription()
+            await pc1.setRemoteDescription(pc2.localDescription)
+            await self.assertIceCompleted(pc1, pc2)
+            self.assertBundled(pc2)
+
+            parsed = SessionDescription.parse(offer.sdp)
+            first_ssrc = parsed.media[0].ssrc[0].ssrc
+            old_ssrc = parsed.media[1].ssrc[0].ssrc
+            new_ssrc = old_ssrc + 1
+            while new_ssrc in (first_ssrc, old_ssrc):
+                new_ssrc += 1
+            receivers = pc2.getReceivers()
+            self.assertEqual(len(remote_tracks), 2)
+            self.assertIs(remote_tracks[1], receivers[1].track)
+            router = receivers[1].transport._rtp_router
+            payload_type = parsed.media[1].rtp.codecs[0].payloadType
+            self.assertIs(
+                router.route_rtp(RtpPacket(ssrc=old_ssrc, payload_type=payload_type)),
+                receivers[1],
+            )
+            self.assertIs(
+                router.route_rtp(RtpPacket(ssrc=first_ssrc, payload_type=payload_type)),
+                receivers[0],
+            )
+
+            # The first speaker continues on MID 0 while the second goes
+            # recvonly. The receiver on MID 1 must persist, then accept a
+            # resumed stream without a duplicate track event.
+            sections = offer.sdp.split("m=audio ", 2)
+            self.assertEqual(len(sections), 3)
+            sections[2] = sections[2].replace("a=sendrecv\r\n", "a=recvonly\r\n", 1)
+            # A sender on hold need not advertise an SSRC, but JSEP
+            # retains its MSID identity until the m-line is rejected.
+            sections[2] = re.sub(r"(?m)^a=ssrc:[^\r]*\r\n", "", sections[2])
+            self.assertNotIn("a=ssrc:", sections[2])
+            hold_sdp = "m=audio ".join(sections)
+            self.assertNotEqual(hold_sdp, offer.sdp)
+            await pc2.setRemoteDescription(
+                RTCSessionDescription(sdp=hold_sdp, type="offer")
+            )
+            await pc2.setLocalDescription()
+            await asyncio.sleep(0)
+            self.assertFalse(receivers[1]._enabled)
+            self.assertIs(receivers[1].track, remote_tracks[1])
+            self.assertEqual(receivers[1].track.readyState, "live")
+            self.assertEqual(len(remote_tracks), 2)
+
+            # Retain the MID and MSID identity; only the RTP source changes.
+            # There are two identical PTs, so PT fallback cannot route it.
+            reoffer_sdp = offer.sdp.replace(
+                f"a=ssrc:{old_ssrc} ", f"a=ssrc:{new_ssrc} "
+            )
+            self.assertNotEqual(reoffer_sdp, offer.sdp)
+            await pc2.setRemoteDescription(
+                RTCSessionDescription(sdp=reoffer_sdp, type="offer")
+            )
+            await pc2.setLocalDescription()
+            await asyncio.sleep(0)
+            self.assertTrue(receivers[1]._enabled)
+            self.assertIs(receivers[1].track, remote_tracks[1])
+            self.assertEqual(receivers[1].track.readyState, "live")
+            self.assertEqual(len(remote_tracks), 2)
+
+            self.assertIs(
+                router.route_rtp(RtpPacket(ssrc=new_ssrc, payload_type=payload_type)),
+                receivers[1],
+            )
+            self.assertIsNone(
+                router.route_rtp(RtpPacket(ssrc=old_ssrc, payload_type=payload_type))
+            )
+            self.assertIs(
+                router.route_rtp(RtpPacket(ssrc=first_ssrc, payload_type=payload_type)),
+                receivers[0],
+            )
+        finally:
+            await pc1.close()
+            await pc2.close()
+
+    @asynctest
     async def test_connect_audio_two_tracks(self) -> None:
         pc1 = RTCPeerConnection()
         pc1_states = track_states(pc1)

@@ -255,6 +255,8 @@ class RtpRouter:
         self.mid_table: dict[str, RtpReceiver] = {}
         self.ssrc_table: dict[int, RtpReceiver] = {}
         self.payload_type_table: dict[int, set[RtpReceiver]] = {}
+        self.ssrc_sequence_table: dict[int, int] = {}
+        self.ssrc_mid_update_table: dict[int, int] = {}
 
     def register_receiver(
         self,
@@ -263,6 +265,8 @@ class RtpRouter:
         payload_types: list[int],
         mid: Optional[str] = None,
     ) -> None:
+        if receiver in self.receivers:
+            self.unregister_receiver(receiver)
         self.receivers.add(receiver)
         if mid is not None:
             self.mid_table[mid] = receiver
@@ -310,26 +314,66 @@ class RtpRouter:
     def route_rtp(self, packet: RtpPacket) -> Optional[RtpReceiver]:
         ssrc_receiver = self.ssrc_table.get(packet.ssrc)
         pt_receivers = self.payload_type_table.get(packet.payload_type, set())
+        mid = packet.extensions.mid
 
-        # the SSRC and payload type are known and match
-        if ssrc_receiver is not None and ssrc_receiver in pt_receivers:
-            return ssrc_receiver
+        if mid is None:
+            if ssrc_receiver is not None and ssrc_receiver in pt_receivers:
+                # Ordinary packets use the SSRC lookup directly. Only track
+                # sequence epochs for a stream that has switched MIDs.
+                if packet.ssrc in self.ssrc_mid_update_table:
+                    self.__update_ssrc_sequence(packet)
+                return ssrc_receiver
+            if ssrc_receiver is None and len(pt_receivers) == 1:
+                receiver = next(iter(pt_receivers))
+                self.ssrc_table[packet.ssrc] = receiver
+                return receiver
+            return None
 
-        # the SSRC is unknown but the payload type matches, update the SSRC table
-        if ssrc_receiver is None and len(pt_receivers) == 1:
-            pt_receiver = list(pt_receivers)[0]
-            self.ssrc_table[packet.ssrc] = pt_receiver
-            return pt_receiver
+        mid_receiver = self.mid_table.get(mid)
+        if mid_receiver is None or mid_receiver not in pt_receivers:
+            return None
 
-        # discard the packet
-        return None
+        if mid_receiver is not ssrc_receiver:
+            # A MID can resolve an ambiguous PT or replace a stale SSRC
+            # association. After a transition, reject a late packet from
+            # the previous MID (RFC 8843 section 9.2).
+            sequence = self.__update_ssrc_sequence(packet)
+            last_update = self.ssrc_mid_update_table.get(packet.ssrc)
+            if last_update is not None and sequence <= last_update:
+                return None
+            self.ssrc_table[packet.ssrc] = mid_receiver
+            self.ssrc_mid_update_table[packet.ssrc] = sequence
+        elif packet.ssrc in self.ssrc_mid_update_table:
+            # Preserve sequence wrap epochs only for streams that have
+            # changed their MID association.
+            self.__update_ssrc_sequence(packet)
+
+        return mid_receiver
+
+    def __update_ssrc_sequence(self, packet: RtpPacket) -> int:
+        last = self.ssrc_sequence_table.get(packet.ssrc)
+        if last is None:
+            sequence = packet.sequence_number
+        else:
+            # Resolve RTP's 16-bit sequence wraparound to a monotonic epoch.
+            delta = ((packet.sequence_number - last + 32768) % 65536) - 32768
+            sequence = last + delta
+        if last is None or sequence > last:
+            self.ssrc_sequence_table[packet.ssrc] = sequence
+        return sequence
 
     def unregister_receiver(self, receiver: RtpReceiver) -> None:
         self.receivers.discard(receiver)
         self.__discard(self.mid_table, receiver)
-        self.__discard(self.ssrc_table, receiver)
-        for pt, receivers in self.payload_type_table.items():
+        for ssrc, mapped_receiver in list(self.ssrc_table.items()):
+            if mapped_receiver == receiver:
+                del self.ssrc_table[ssrc]
+                self.ssrc_sequence_table.pop(ssrc, None)
+                self.ssrc_mid_update_table.pop(ssrc, None)
+        for pt, receivers in list(self.payload_type_table.items()):
             receivers.discard(receiver)
+            if not receivers:
+                del self.payload_type_table[pt]
 
     def unregister_sender(self, sender: RtpSender) -> None:
         self.__discard(self.senders, sender)
@@ -687,6 +731,8 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         ssrcs = set()
         for encoding in parameters.encodings:
             ssrcs.add(encoding.ssrc)
+            if encoding.rtx is not None:
+                ssrcs.add(encoding.rtx.ssrc)
 
         self._rtp_header_extensions_map.configure(parameters)
         self._rtp_router.register_receiver(

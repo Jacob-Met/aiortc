@@ -15,7 +15,9 @@ from aiortc.rtcdtlstransport import (
 from aiortc.rtcrtpparameters import (
     RTCRtpCodecParameters,
     RTCRtpDecodingParameters,
+    RTCRtpHeaderExtensionParameters,
     RTCRtpReceiveParameters,
+    RTCRtpRtxParameters,
 )
 from aiortc.rtp import (
     RTCP_PSFB_APP,
@@ -594,6 +596,179 @@ class RtpRouterTest(TestCase):
 
         # unknown SSRC and payload type
         self.assertEqual(router.route_rtp(RtpPacket(ssrc=6789, payload_type=100)), None)
+
+    def test_route_rtp_ambiguous_payload_type_mid(self) -> None:
+        receiver1 = DummyRtpReceiver()
+        receiver2 = DummyRtpReceiver()
+        router = RtpRouter()
+        router.register_receiver(receiver1, ssrcs=[1234], payload_types=[96], mid="0")
+        router.register_receiver(receiver2, ssrcs=[2345], payload_types=[96], mid="1")
+
+        # Without an SSRC association or MID, both tracks could decode PT 96.
+        self.assertIsNone(router.route_rtp(RtpPacket(ssrc=3456, payload_type=96)))
+
+        packet = RtpPacket(ssrc=3456, payload_type=96, sequence_number=100)
+        packet.extensions.mid = "1"
+        self.assertIs(router.route_rtp(packet), receiver2)
+        self.assertIs(
+            router.route_rtp(RtpPacket(ssrc=3456, payload_type=96)),
+            receiver2,
+        )
+
+        # An unknown MID or a codec not negotiated on that MID cannot route.
+        packet = RtpPacket(ssrc=4567, payload_type=96)
+        packet.extensions.mid = "unnegotiated"
+        self.assertIsNone(router.route_rtp(packet))
+        packet.extensions.mid = "0"
+        packet.payload_type = 98
+        self.assertIsNone(router.route_rtp(packet))
+        self.assertNotIn(4567, router.ssrc_table)
+
+        # RFC 8843 section 9.2 permits a newer MID to update SSRC routing.
+        packet = RtpPacket(ssrc=3456, payload_type=96, sequence_number=101)
+        packet.extensions.mid = "0"
+        self.assertIs(router.route_rtp(packet), receiver1)
+
+        # A delayed packet with the older MID must not flip the association.
+        packet.sequence_number = 99
+        packet.extensions.mid = "1"
+        self.assertIsNone(router.route_rtp(packet))
+        self.assertIs(router.ssrc_table[3456], receiver1)
+
+        # A MID update across a 16-bit sequence wrap must still win.
+        packet = RtpPacket(ssrc=5678, payload_type=96, sequence_number=65534)
+        packet.extensions.mid = "0"
+        self.assertIs(router.route_rtp(packet), receiver1)
+        packet.sequence_number = 65535
+        self.assertIs(router.route_rtp(packet), receiver1)
+        packet.sequence_number = 0
+        packet.extensions.mid = "1"
+        self.assertIs(router.route_rtp(packet), receiver2)
+        packet.sequence_number = 65533
+        packet.extensions.mid = "0"
+        self.assertIsNone(router.route_rtp(packet))
+        self.assertIs(router.ssrc_table[5678], receiver2)
+
+    @asynctest
+    async def test_route_rtp_wire_mid_bundle(self) -> None:
+        transport = RTCDtlsTransport(
+            dummy_ice_transport_pair()[0],
+            [RTCCertificate.generateCertificate()],
+        )
+        receiver1 = DummyRtpReceiver()
+        receiver2 = DummyRtpReceiver()
+        extension = RTCRtpHeaderExtensionParameters(
+            id=1, uri="urn:ietf:params:rtp-hdrext:sdes:mid"
+        )
+        codecs = [
+            RTCRtpCodecParameters(
+                mimeType="audio/opus", clockRate=48000, payloadType=96
+            )
+        ]
+        for mid, ssrc, receiver in [
+            ("0", 100, receiver1),
+            ("1", 200, receiver2),
+        ]:
+            transport._register_rtp_receiver(
+                receiver,
+                RTCRtpReceiveParameters(
+                    codecs=codecs,
+                    headerExtensions=[extension],
+                    muxId=mid,
+                    encodings=[RTCRtpDecodingParameters(ssrc=ssrc, payloadType=96)],
+                ),
+            )
+
+        # Parse actual wire-format RTP/MID extension and dispatch through
+        # the DTLS transport, not just through the router directly.
+        packet = RtpPacket(ssrc=300, payload_type=96, sequence_number=42)
+        packet.extensions.mid = "1"
+        await transport._handle_rtp_data(
+            packet.serialize(transport._rtp_header_extensions_map),
+            arrival_time_ms=1234,
+        )
+        self.assertEqual(receiver1.rtp_packets, [])
+        self.assertEqual(len(receiver2.rtp_packets), 1)
+        self.assertEqual(receiver2.rtp_packets[0].ssrc, 300)
+        self.assertEqual(receiver2.rtp_packets[0].extensions.mid, "1")
+
+    def test_register_rtp_receiver_with_rtx_ssrc(self) -> None:
+        transport = RTCDtlsTransport(
+            dummy_ice_transport_pair()[0],
+            [RTCCertificate.generateCertificate()],
+        )
+        receiver1 = DummyRtpReceiver()
+        receiver2 = DummyRtpReceiver()
+        codecs = [
+            RTCRtpCodecParameters(
+                mimeType="video/VP8", clockRate=90000, payloadType=96
+            ),
+            RTCRtpCodecParameters(
+                mimeType="video/rtx",
+                clockRate=90000,
+                payloadType=97,
+                parameters={"apt": 96},
+            ),
+        ]
+
+        def parameters(mid: str, ssrc: int, rtx_ssrc: int) -> RTCRtpReceiveParameters:
+            return RTCRtpReceiveParameters(
+                codecs=codecs,
+                muxId=mid,
+                encodings=[
+                    RTCRtpDecodingParameters(
+                        ssrc=ssrc,
+                        payloadType=96,
+                        rtx=RTCRtpRtxParameters(ssrc=rtx_ssrc),
+                    )
+                ],
+            )
+
+        transport._register_rtp_receiver(receiver1, parameters("0", 100, 101))
+        transport._register_rtp_receiver(receiver2, parameters("1", 200, 201))
+        router = transport._rtp_router
+
+        # Both video tracks use the same RTX PT, so RTX SSRC is required
+        # even if retransmissions carry no MID extension.
+        self.assertIs(router.route_rtp(RtpPacket(ssrc=101, payload_type=97)), receiver1)
+        self.assertIs(router.route_rtp(RtpPacket(ssrc=201, payload_type=97)), receiver2)
+
+        transport._register_rtp_receiver(receiver2, parameters("1", 300, 301))
+        self.assertNotIn(201, router.ssrc_table)
+        self.assertIs(router.route_rtp(RtpPacket(ssrc=301, payload_type=97)), receiver2)
+
+    def test_register_receiver_replaces_mappings(self) -> None:
+        receiver1 = DummyRtpReceiver()
+        receiver2 = DummyRtpReceiver()
+        router = RtpRouter()
+        router.register_receiver(
+            receiver1, ssrcs=[1234], payload_types=[96, 97], mid="0"
+        )
+        router.register_receiver(receiver2, ssrcs=[2345], payload_types=[96], mid="1")
+
+        # A renegotiated SSRC and PT replace the old mappings without
+        # touching another receiver sharing the same RTP payload type.
+        router.register_receiver(receiver1, ssrcs=[3456], payload_types=[98], mid="0")
+        self.assertNotIn(1234, router.ssrc_table)
+        self.assertIs(router.ssrc_table[3456], receiver1)
+        self.assertIs(router.ssrc_table[2345], receiver2)
+        self.assertNotIn(97, router.payload_type_table)
+        self.assertEqual(router.payload_type_table[96], {receiver2})
+        self.assertEqual(router.payload_type_table[98], {receiver1})
+        self.assertEqual(router.mid_table["0"], receiver1)
+        self.assertEqual(router.mid_table["1"], receiver2)
+
+        # RTCP sender reports follow the changed SSRC map as well.
+        sender_info = RtcpSenderInfo(
+            ntp_timestamp=0, rtp_timestamp=0, packet_count=0, octet_count=0
+        )
+        self.assertEqual(
+            router.route_rtcp(RtcpSrPacket(ssrc=1234, sender_info=sender_info)), set()
+        )
+        self.assertEqual(
+            router.route_rtcp(RtcpSrPacket(ssrc=3456, sender_info=sender_info)),
+            {receiver1},
+        )
 
     def test_route_rtp_ambiguous_payload_type(self) -> None:
         receiver1 = DummyRtpReceiver()

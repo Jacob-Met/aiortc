@@ -314,6 +314,7 @@ class RTCRtpReceiver:
         self.__lsr_time: dict[int, float] = {}
         self.__remote_streams: dict[int, StreamStatistics] = {}
         self.__rtcp_ssrc: Optional[int] = None
+        self.__receive_parameters: Optional[RTCRtpReceiveParameters] = None
 
         # logging
         self.__log_debug: Callable[..., None] = lambda *args: None
@@ -395,13 +396,17 @@ class RTCRtpReceiver:
 
         :param parameters: The :class:`RTCRtpParameters` for the receiver.
         """
-        if not self.__started:
-            for codec in parameters.codecs:
-                self.__codecs[codec.payloadType] = codec
-            for encoding in parameters.encodings:
-                if encoding.rtx:
-                    self.__rtx_ssrc[encoding.rtx.ssrc] = encoding.ssrc
+        if self.__receive_parameters != parameters:
+            self.__codecs = {codec.payloadType: codec for codec in parameters.codecs}
+            self.__rtx_ssrc = {
+                encoding.rtx.ssrc: encoding.ssrc
+                for encoding in parameters.encodings
+                if encoding.rtx
+            }
+            self.__transport._register_rtp_receiver(self, parameters)
+            self.__receive_parameters = parameters
 
+        if not self.__started:
             # start decoder thread
             self.__decoder_thread = threading.Thread(
                 target=decoder_worker,
@@ -415,7 +420,6 @@ class RTCRtpReceiver:
             )
             self.__decoder_thread.start()
 
-            self.__transport._register_rtp_receiver(self, parameters)
             self.__rtcp_task = asyncio.ensure_future(self._run_rtcp())
             self.__started = True
 
